@@ -43,3 +43,20 @@ ssh -N -D 1080 root@47.88.77.200
 解析器不会调用本地 shell，也不会执行粘贴内容里的 PowerShell/cmd 管道或重定向；不支持的 SSH 参数会直接报错。当前版本暂不支持 `-L`、`-R`、`-J` 等其他转发模式。
 
 首次连接未知主机时，为了方便本地使用，程序会接受该 Host key，并把指纹显示在右侧会话信息中。生产环境使用前应当与服务器管理员提供的指纹核对。
+
+## Codex 配置可视化
+
+`codex_config_gui.py` 是一个不依赖第三方包的单文件 Tkinter 工具，用于编辑当前用户的 `~/.codex/config.toml`：
+
+- 可添加、删除、修改 `model_providers`，Bearer Token 按明文显示；
+- 固定参数（provider、model、reasoning）与可变参数（sandbox、profile、额外 `-c`、prompt）分栏预览；
+- 按“编辑供应商 → 写入配置 → 拼接命令 → 运行 Codex”的流程执行；
+- 写盘前自动生成 `config.toml.bak`，并保留原配置中的项目、插件、MCP 等无关区块。
+
+启动：
+
+```powershell
+python codex_config_gui.py
+```
+
+工具会直接调用 `codex.cmd` 并打开独立终端，保留 Codex TUI 的正常交互；主窗口显示拼接命令、PID 和退出状态。Token 只会写入用户自己的 Codex 配置，不要把 `config.toml` 或备份文件提交到仓库。
