@@ -361,8 +361,16 @@ class CodexConfigStudio(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1450x900")
-        self.minsize(1120, 720)
+        # Start at a useful size for the current display, but leave enough
+        # room for the app to be used on a 1080p laptop or a small remote
+        # desktop session.  The old fixed 1450x900 window was wider than the
+        # screen in a number of common setups and hid the left-side actions.
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        initial_width = min(1500, max(980, screen_width - 72))
+        initial_height = min(920, max(660, screen_height - 96))
+        self.geometry(f"{initial_width}x{initial_height}")
+        self.minsize(940, 620)
         self.configure(bg=self.BG)
         self.providers: list[Provider] = []
         self.selected_provider = 0
@@ -370,6 +378,7 @@ class CodexConfigStudio(tk.Tk):
         self.process: subprocess.Popen[str] | None = None
         self.test_events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.test_thread: threading.Thread | None = None
+        self.scroll_targets: list[tuple[tk.Widget, tk.Canvas]] = []
 
         self.provider_id = tk.StringVar()
         self.provider_name = tk.StringVar()
@@ -393,6 +402,9 @@ class CodexConfigStudio(tk.Tk):
 
         self._style()
         self._layout()
+        self.bind_all("<MouseWheel>", self._route_mousewheel, add="+")
+        self.bind_all("<Button-4>", lambda event: self._route_mousewheel(event, -3), add="+")
+        self.bind_all("<Button-5>", lambda event: self._route_mousewheel(event, 3), add="+")
         self._load_config_into_ui()
         self._bind_reactive_inputs()
         self._refresh_command_preview()
@@ -426,26 +438,127 @@ class CodexConfigStudio(tk.Tk):
         style.map("Treeview", background=[("selected", "#234c73")], foreground=[("selected", "#ffffff")])
 
     def _layout(self) -> None:
-        outer = ttk.Frame(self, style="App.TFrame", padding=18)
+        outer = ttk.Frame(self, style="App.TFrame", padding=12)
         outer.pack(fill="both", expand=True)
         top = ttk.Frame(outer, style="App.TFrame")
-        top.pack(fill="x", pady=(0, 14))
-        ttk.Label(top, text=APP_TITLE, style="Title.TLabel").pack(side="left")
-        ttk.Label(top, text="CONFIG → COMMAND → RUN", style="Muted.TLabel").pack(side="left", padx=(14, 0), pady=(5, 0))
+        top.pack(fill="x", pady=(0, 10))
+        title_group = ttk.Frame(top, style="App.TFrame")
+        title_group.pack(side="left", fill="x", expand=True)
+        ttk.Label(title_group, text=APP_TITLE, style="Title.TLabel").pack(side="left")
+        ttk.Label(title_group, text="CONFIG → COMMAND → RUN", style="Muted.TLabel").pack(side="left", padx=(12, 0), pady=(4, 0))
         ttk.Button(top, text="重新读取 config.toml", command=self._reload_config).pack(side="right")
 
         split = ttk.PanedWindow(outer, orient="horizontal")
         split.pack(fill="both", expand=True)
-        left = ttk.Frame(split, style="Panel.TFrame", padding=15)
-        right = ttk.Frame(split, style="Panel.TFrame", padding=(15, 13, 15, 13))
+        left = ttk.Frame(split, style="Panel.TFrame", width=360)
+        right = ttk.Frame(split, style="Panel.TFrame", padding=(14, 12, 14, 12))
+        # Give the editor a stable minimum while allowing the command/log
+        # side to take the remaining space.  PanedWindow weights are honored
+        # when the user resizes the window.
+        # ``ttk.PanedWindow`` on some Windows Tk builds only accepts ``weight``
+        # in ``add`` (classic Tk accepts more pane options).  Keep the call
+        # portable and establish the initial divider position below.
         split.add(left, weight=0)
         split.add(right, weight=1)
-        self._provider_panel(left)
+        self._provider_scroll_panel(left)
         self._right_panel(right)
+        self.main_split = split
+        self.after(160, self._position_main_split)
+
+    def _position_main_split(self) -> None:
+        """Give the editor a predictable starting width without locking it."""
+        split = getattr(self, "main_split", None)
+        if split is None:
+            return
+        try:
+            width = split.winfo_width()
+            if width > 0:
+                split.sashpos(0, min(390, max(320, int(width * 0.27))))
+        except tk.TclError:
+            pass
+
+    def _register_scroll_target(self, container: tk.Widget, canvas: tk.Canvas) -> None:
+        self.scroll_targets.append((container, canvas))
+
+    def _route_mousewheel(self, event: tk.Event, linux_delta: int | None = None) -> str | None:
+        """Send the wheel to the scroll area under the pointer.
+
+        Text boxes and the provider list keep their native scrolling.  Other
+        controls (entries, labels, buttons) scroll their containing form.
+        """
+        if isinstance(event.widget, (tk.Text, tk.Listbox)):
+            return None
+        widget: tk.Widget | None = event.widget
+        while widget is not None:
+            for container, canvas in self.scroll_targets:
+                if widget is container:
+                    if linux_delta is None:
+                        raw_delta = getattr(event, "delta", 0)
+                        delta = int(-raw_delta / 120) if raw_delta else 0
+                    else:
+                        delta = linux_delta
+                    if delta:
+                        canvas.yview_scroll(delta, "units")
+                        return "break"
+                    return None
+            widget = getattr(widget, "master", None)
+        return None
+
+    def _provider_scroll_panel(self, parent: ttk.Frame) -> None:
+        """Build a vertically scrollable provider editor.
+
+        The provider form is intentionally longer than a small laptop
+        viewport.  Keeping it in a canvas means every control remains
+        reachable instead of being clipped below the fold.
+        """
+        container = ttk.Frame(parent, style="Panel.TFrame")
+        container.pack(fill="both", expand=True)
+        canvas = tk.Canvas(
+            container,
+            background=self.PANEL,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = ttk.Frame(canvas, style="Panel.TFrame", padding=14)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        self.provider_canvas = canvas
+        self.provider_inner = inner
+        self.provider_wrap_labels: list[tk.Widget] = []
+        self._register_scroll_target(container, canvas)
+
+        def update_scroll_region(_event: tk.Event | None = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def fit_inner_width(event: tk.Event) -> None:
+            canvas.itemconfigure(window_id, width=max(1, event.width))
+            # Labels with explanatory text should follow the actual pane
+            # width rather than a hard-coded 285 px wrap length.
+            wraplength = max(180, event.width - 28)
+            for widget in getattr(self, "provider_wrap_labels", []):
+                widget.configure(wraplength=wraplength)
+            update_scroll_region()
+
+        inner.bind("<Configure>", update_scroll_region)
+        canvas.bind("<Configure>", fit_inner_width)
+
+        self._provider_panel(inner)
 
     def _provider_panel(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="供应商配置", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(parent, text="添加第三方供应商，并配置它的 API 类型与连接信息。", style="Muted.TLabel", wraplength=285, justify="left").pack(anchor="w", pady=(4, 10))
+        intro = ttk.Label(
+            parent,
+            text="添加第三方供应商，并配置它的 API 类型与连接信息。",
+            style="Muted.TLabel",
+            wraplength=285,
+            justify="left",
+        )
+        intro.pack(anchor="w", pady=(4, 10))
+        self.provider_wrap_labels.append(intro)
         list_row = ttk.Frame(parent, style="Panel.TFrame")
         list_row.pack(fill="x", pady=(0, 9))
         self.provider_list = tk.Listbox(list_row, height=8, bg="#0d151f", fg=self.TEXT, selectbackground="#234c73", selectforeground="#ffffff", activestyle="none", highlightthickness=0, relief="flat", font=("Segoe UI", 10))
@@ -467,27 +580,68 @@ class CodexConfigStudio(tk.Tk):
             state="readonly",
         )
         self.protocol_combo.pack(fill="x", pady=(0, 4))
-        ttk.Label(
+        protocol_hint = ttk.Label(
             parent,
             textvariable=self.protocol_hint,
             style="Muted.TLabel",
             wraplength=285,
             justify="left",
-        ).pack(anchor="w", pady=(0, 8))
+        )
+        protocol_hint.pack(anchor="w", pady=(0, 8))
+        self.provider_wrap_labels.append(protocol_hint)
         self._entry(parent, "Bearer Token（明文）", self.token)
-        ttk.Checkbutton(parent, text="使用 Codex/OpenAI 登录认证（requires_openai_auth）", variable=self.requires_openai_auth).pack(anchor="w", pady=(2, 3))
-        ttk.Checkbutton(parent, text="supports_websockets", variable=self.supports_websockets).pack(anchor="w", pady=(0, 10))
+        ttk.Checkbutton(parent, text="Codex/OpenAI 登录认证", variable=self.requires_openai_auth).pack(anchor="w", pady=(2, 3))
+        ttk.Checkbutton(parent, text="启用 supports_websockets", variable=self.supports_websockets).pack(anchor="w", pady=(0, 10))
         provider_actions = ttk.Frame(parent, style="Panel.TFrame")
         provider_actions.pack(fill="x")
         ttk.Button(provider_actions, text="应用修改", command=self._apply_provider_form).pack(side="left", fill="x", expand=True, padx=(0, 4))
         self.test_button = ttk.Button(provider_actions, text="连通测试", style="Primary.TButton", command=self._test_provider)
         self.test_button.pack(side="left", fill="x", expand=True, padx=(4, 0))
-        ttk.Label(parent, textvariable=self.test_status, style="Muted.TLabel", wraplength=285, justify="left").pack(anchor="w", pady=(7, 0))
+        test_status = ttk.Label(parent, textvariable=self.test_status, style="Muted.TLabel", wraplength=285, justify="left")
+        test_status.pack(anchor="w", pady=(7, 0))
+        self.provider_wrap_labels.append(test_status)
         ttk.Button(parent, text="写入 config.toml", style="Primary.TButton", command=self._write_config).pack(fill="x", pady=(8, 0))
-        ttk.Label(parent, textvariable=self.config_status, style="Muted.TLabel", wraplength=260, justify="left").pack(anchor="w", pady=(12, 0))
+        config_status = ttk.Label(parent, textvariable=self.config_status, style="Muted.TLabel", wraplength=260, justify="left")
+        config_status.pack(anchor="w", pady=(12, 0))
+        self.provider_wrap_labels.append(config_status)
 
     def _right_panel(self, parent: ttk.Frame) -> None:
-        flow = tk.Frame(parent, bg=self.PANEL_2, highlightbackground=self.BORDER, highlightthickness=1)
+        split = ttk.PanedWindow(parent, orient="vertical")
+        split.pack(fill="both", expand=True)
+        command_container = ttk.Frame(split, style="Panel.TFrame")
+        log_container = ttk.Frame(split, style="Panel.TFrame", padding=(0, 10, 0, 0))
+        split.add(command_container, weight=3)
+        split.add(log_container, weight=2)
+        self.right_split = split
+        self.after(180, self._position_right_split)
+
+        canvas = tk.Canvas(
+            command_container,
+            background=self.PANEL,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        scrollbar = ttk.Scrollbar(command_container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        command_area = ttk.Frame(canvas, style="Panel.TFrame", padding=(0, 0, 8, 0))
+        window_id = canvas.create_window((0, 0), window=command_area, anchor="nw")
+        self.command_canvas = canvas
+        self._register_scroll_target(command_container, canvas)
+
+        command_area.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+
+        def fit_command_width(event: tk.Event) -> None:
+            canvas.itemconfigure(window_id, width=max(1, event.width))
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        canvas.bind("<Configure>", fit_command_width)
+
+        flow = tk.Frame(command_area, bg=self.PANEL_2)
         flow.pack(fill="x", pady=(0, 12))
         tk.Label(flow, text="执行流程", bg=self.PANEL_2, fg=self.TEXT, font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=13, pady=(10, 3))
         flow_steps = tk.Frame(flow, bg=self.PANEL_2)
@@ -498,25 +652,46 @@ class CodexConfigStudio(tk.Tk):
             ("03", "拼接命令", "固定块 +\n可变块"),
             ("04", "运行 Codex", "新终端\n交互执行"),
         )
-        for index, (number, title, detail) in enumerate(steps):
-            flow_steps.columnconfigure(index * 2, weight=1)
+        flow_cards: list[tk.Frame] = []
+        for number, title, detail in steps:
             card = tk.Frame(flow_steps, bg="#1b2b3c", highlightbackground=self.BORDER, highlightthickness=1)
-            card.grid(row=0, column=index * 2, sticky="ew")
+            flow_cards.append(card)
             tk.Label(card, text=number, bg="#244463", fg="#9bd0ff", font=("Cascadia Mono", 9, "bold")).pack(anchor="w", padx=8, pady=(7, 2))
             tk.Label(card, text=title, bg="#1b2b3c", fg=self.TEXT, font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=8)
             tk.Label(card, text=detail, bg="#1b2b3c", fg=self.MUTED, justify="left", font=("Segoe UI", 8)).pack(anchor="w", padx=8, pady=(1, 7))
-            if index < len(steps) - 1:
-                tk.Label(flow_steps, text="→", bg=self.PANEL_2, fg=self.BLUE, font=("Segoe UI", 14, "bold")).grid(row=0, column=index * 2 + 1, padx=6)
 
-        settings = ttk.Frame(parent, style="Panel.TFrame")
+        flow_columns = 0
+
+        def arrange_flow(event: tk.Event) -> None:
+            nonlocal flow_columns
+            columns = 4 if event.width >= 820 else 2
+            if columns == flow_columns:
+                return
+            flow_columns = columns
+            for column in range(4):
+                flow_steps.columnconfigure(column, weight=1 if column < columns else 0, uniform="flow")
+            for index, card in enumerate(flow_cards):
+                card.grid(
+                    row=index // columns,
+                    column=index % columns,
+                    sticky="nsew",
+                    padx=(0 if index % columns == 0 else 5, 0),
+                    pady=(0 if index < columns else 5, 0),
+                )
+
+        flow_steps.bind("<Configure>", arrange_flow)
+
+        settings = ttk.Frame(command_area, style="Panel.TFrame")
         settings.pack(fill="x", pady=(0, 12))
         ttk.Label(settings, text="模型与命令参数", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
         row = ttk.Frame(settings, style="Panel.TFrame")
         row.pack(fill="x")
         self._labeled_combo(row, "当前供应商", self.active_provider, (), 0, readonly=True)
-        self._labeled_grid_entry(row, "模型 ID（任意自定义）", self.active_model, 1, weight=2)
-        self._labeled_combo(row, "Reasoning", self.reasoning_effort, ("minimal", "low", "medium", "high", "xhigh"), 2)
-        ttk.Label(settings, text="模型 ID 不做品牌限制，直接填写供应商提供的精确 ID。", style="Muted.TLabel").pack(anchor="w", pady=(4, 7))
+        self._labeled_combo(row, "Reasoning", self.reasoning_effort, ("minimal", "low", "medium", "high", "xhigh"), 1)
+        model_row = ttk.Frame(settings, style="Panel.TFrame")
+        model_row.pack(fill="x", pady=(8, 0))
+        self._labeled_grid_entry(model_row, "模型 ID（任意自定义）", self.active_model, 0, weight=1)
+        ttk.Label(settings, text="模型 ID 不做品牌限制，直接填写供应商提供的精确 ID。", style="Muted.TLabel", wraplength=560).pack(anchor="w", pady=(4, 7))
         self._entry(settings, "Prompt（可选）", self.prompt)
         row2 = ttk.Frame(settings, style="Panel.TFrame")
         row2.pack(fill="x")
@@ -525,20 +700,31 @@ class CodexConfigStudio(tk.Tk):
         self._entry(settings, "额外 -c 参数（可选，逐项空格分隔）", self.extra_config)
         ttk.Checkbutton(settings, text="强制带上 provider / model / reasoning 参数", variable=self.force_selection, command=self._refresh_command_preview).pack(anchor="w", pady=(3, 0))
 
-        ttk.Label(parent, text="固定信息与可变信息拼接结果", style="Section.TLabel").pack(anchor="w", pady=(0, 7))
-        self.command_preview = ScrolledText(parent, height=9, state="disabled", wrap="word", bg=self.TERMINAL, fg="#8bd0ff", relief="flat", borderwidth=0, padx=12, pady=10, font=("Cascadia Mono", 10))
+        ttk.Label(command_area, text="固定信息与可变信息拼接结果", style="Section.TLabel").pack(anchor="w", pady=(0, 7))
+        self.command_preview = ScrolledText(command_area, height=7, state="disabled", wrap="word", bg=self.TERMINAL, fg="#8bd0ff", relief="flat", borderwidth=0, padx=12, pady=10, font=("Cascadia Mono", 10))
         self.command_preview.pack(fill="x", pady=(0, 10))
-        action_row = ttk.Frame(parent, style="Panel.TFrame")
-        action_row.pack(fill="x", pady=(0, 11))
+        action_row = ttk.Frame(command_area, style="Panel.TFrame")
+        action_row.pack(fill="x", pady=(0, 4))
         self.write_run_button = ttk.Button(action_row, text="写入配置并打开 Codex 终端", style="Primary.TButton", command=self._write_and_run)
         self.write_run_button.pack(side="left")
         self.stop_button = ttk.Button(action_row, text="停止 Codex", style="Danger.TButton", state="disabled", command=self._stop_process)
         self.stop_button.pack(side="left", padx=(8, 0))
-        ttk.Label(action_row, textvariable=self.command_status, style="Muted.TLabel").pack(side="left", padx=(15, 0))
+        ttk.Label(command_area, textvariable=self.command_status, style="Muted.TLabel", wraplength=560).pack(anchor="w", fill="x", pady=(3, 4))
 
-        ttk.Label(parent, text="运行日志（Codex 交互界面在新终端）", style="Section.TLabel").pack(anchor="w", pady=(0, 7))
-        self.output = ScrolledText(parent, state="disabled", wrap="word", bg=self.TERMINAL, fg="#d8e4f2", relief="flat", borderwidth=0, padx=12, pady=10, font=("Cascadia Mono", 9))
+        ttk.Label(log_container, text="运行日志（Codex 交互界面在新终端）", style="Section.TLabel").pack(anchor="w", pady=(0, 7))
+        self.output = ScrolledText(log_container, state="disabled", wrap="word", bg=self.TERMINAL, fg="#d8e4f2", relief="flat", borderwidth=0, padx=12, pady=10, font=("Cascadia Mono", 9))
         self.output.pack(fill="both", expand=True)
+
+    def _position_right_split(self) -> None:
+        split = getattr(self, "right_split", None)
+        if split is None:
+            return
+        try:
+            height = split.winfo_height()
+            if height > 0:
+                split.sashpos(0, min(520, max(360, int(height * 0.68))))
+        except tk.TclError:
+            pass
 
     def _entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar, side: bool = False) -> None:
         if side:

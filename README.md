@@ -1,17 +1,17 @@
-# Nexus SSH
+# Local Tools
 
-一个本地运行的可视化 SSH 客户端，使用 Tkinter 绘制界面，Paramiko 建立 SSH 连接。
+这里是两个完全独立的本地可视化应用：SSH 客户端和 Codex 配置工具。它们有各自的启动目录、入口和说明，不会在运行时互相加载。
 
-## 启动
+## 目录
 
-```powershell
-python -m pip install -r requirements.txt
-python app.py
-```
+| 应用 | 目录 | 启动 |
+| --- | --- | --- |
+| Nexus SSH | `ssh-app` | 双击 `run_ssh.bat`，或在目录中运行 `python run.py` |
+| Codex Config Studio | `codex-app` | 双击 `run_codex.bat`，或在目录中运行 `python run.py` |
 
-Windows 也可以双击 `run.bat`。
+SSH 应用会在首次启动时安装 `paramiko`；Codex 应用只使用 Python 标准库 Tkinter。
 
-## 功能
+## Nexus SSH
 
 - 密码认证和私钥认证
 - 交互式 SSH shell、命令历史、Ctrl+C、中断和快捷命令
@@ -22,7 +22,7 @@ Windows 也可以双击 `run.bat`。
 - 密码与私钥口令只保存在当前进程内，不写入配置文件
 - 显示远端 Host key 类型和 SHA-256 指纹
 
-## 粘贴命令执行
+SSH 命令输入框支持：
 
 在左侧“命令解析 / 执行”输入框粘贴：
 
@@ -44,9 +44,9 @@ ssh -N -D 1080 root@47.88.77.200
 
 首次连接未知主机时，为了方便本地使用，程序会接受该 Host key，并把指纹显示在右侧会话信息中。生产环境使用前应当与服务器管理员提供的指纹核对。
 
-## Codex 配置可视化
+## Codex Config Studio
 
-`codex_config_gui.py` 是一个不依赖第三方包的单文件 Tkinter 工具，用于编辑当前用户的 `~/.codex/config.toml`：
+`codex-app/codex_config_gui.py` 是一个不依赖第三方包的单文件 Tkinter 工具，用于编辑当前用户的 `~/.codex/config.toml`：
 
 - 可添加、删除、修改任意第三方 `model_providers`，Bearer Token 按明文显示；
 - API 协议提供 `OpenAI` 与 `Anthropic` 两种类型；当前 Codex 原生只接受 Responses API，Anthropic 原生接口需要兼容网关转换；
@@ -55,11 +55,5 @@ ssh -N -D 1080 root@47.88.77.200
 - 固定参数（provider、model、reasoning）与可变参数（sandbox、profile、额外 `-c`、prompt）分栏预览；
 - 按“编辑供应商 → 写入配置 → 拼接命令 → 运行 Codex”的流程执行；
 - 写盘前自动生成 `config.toml.bak`，并保留原配置中的项目、插件、MCP 等无关区块。
-
-启动：
-
-```powershell
-python codex_config_gui.py
-```
 
 工具会直接调用 `codex.cmd` 并打开独立终端，保留 Codex TUI 的正常交互；主窗口显示拼接命令、PID 和退出状态。Token 只会写入用户自己的 Codex 配置，不要把 `config.toml` 或备份文件提交到仓库。
