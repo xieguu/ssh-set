@@ -51,6 +51,7 @@ ssh -N -D 1080 root@47.88.77.200
 - 可添加、删除、修改任意第三方 `model_providers`，Bearer Token 按明文显示；
 - API 协议提供 `OpenAI` 与 `Anthropic` 两种类型；当前 Codex 原生只接受 Responses API，Anthropic 原生接口需要兼容网关转换；
 - 模型 ID 是自由输入框，不限制 OpenAI，可填写供应商提供的任意精确模型 ID；
+- “连通测试”会按当前表单向 OpenAI `/v1/responses` 或 Anthropic `/v1/messages` 发送最小请求，显示 HTTP 状态、耗时和响应摘要，Token 不会写入日志；
 - 固定参数（provider、model、reasoning）与可变参数（sandbox、profile、额外 `-c`、prompt）分栏预览；
 - 按“编辑供应商 → 写入配置 → 拼接命令 → 运行 Codex”的流程执行；
 - 写盘前自动生成 `config.toml.bak`，并保留原配置中的项目、插件、MCP 等无关区块。

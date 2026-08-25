@@ -7,9 +7,13 @@ with explicit provider/model/reasoning overrides so the selected values win.
 
 from __future__ import annotations
 
+import json
+import queue
 import re
 import shutil
 import subprocess
+import threading
+import time
 import tkinter as tk
 import tomllib
 from dataclasses import dataclass
@@ -17,6 +21,8 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Any
+from urllib import error as url_error
+from urllib import request as url_request
 
 
 APP_TITLE = "Codex Config Studio"
@@ -26,6 +32,7 @@ CODEX_COMMAND = "codex.cmd"
 API_PROTOCOL_OPENAI = "openai"
 API_PROTOCOL_ANTHROPIC = "anthropic"
 API_PROTOCOLS = (API_PROTOCOL_OPENAI, API_PROTOCOL_ANTHROPIC)
+TEST_TIMEOUT_SECONDS = 20
 
 
 def toml_string(value: str) -> str:
@@ -52,6 +59,99 @@ def dict_value(data: dict[str, Any], key: str, default: Any = "") -> Any:
 
 def normalize_api_protocol(value: str) -> str:
     return value if value in API_PROTOCOLS else API_PROTOCOL_OPENAI
+
+
+def api_protocol_label(value: str) -> str:
+    return "Anthropic" if normalize_api_protocol(value) == API_PROTOCOL_ANTHROPIC else "OpenAI"
+
+
+def test_endpoint(base_url: str, api_protocol: str) -> str:
+    """Build a standard health-check endpoint from a provider base URL."""
+    base = base_url.strip().rstrip("/")
+    if not base:
+        raise ValueError("Base URL 不能为空")
+    protocol = normalize_api_protocol(api_protocol)
+    suffix = "/messages" if protocol == API_PROTOCOL_ANTHROPIC else "/responses"
+    if base.lower().endswith(suffix):
+        return base
+    if base.lower().endswith("/v1"):
+        return base + suffix
+    return base + "/v1" + suffix
+
+
+def test_request_payload(provider: "Provider", model: str) -> tuple[str, dict[str, str], bytes]:
+    """Create a minimal request without exposing the bearer token in logs."""
+    protocol = normalize_api_protocol(provider.api_protocol)
+    endpoint = test_endpoint(provider.base_url, protocol)
+    if not model.strip():
+        raise ValueError("模型 ID 不能为空")
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "codex-config-studio/1.0",
+    }
+    if provider.token:
+        if protocol == API_PROTOCOL_ANTHROPIC:
+            headers["x-api-key"] = provider.token
+            headers["anthropic-version"] = "2023-06-01"
+        else:
+            headers["Authorization"] = f"Bearer {provider.token}"
+    if protocol == API_PROTOCOL_ANTHROPIC:
+        payload = {
+            "model": model.strip(),
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "只回复 OK"}],
+        }
+    else:
+        payload = {
+            "model": model.strip(),
+            "input": "只回复 OK",
+            "max_output_tokens": 16,
+        }
+    return endpoint, headers, json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def redact_secret(value: str, secret: str) -> str:
+    if not secret:
+        return value
+    return value.replace(secret, "***")
+
+
+def response_summary(api_protocol: str, raw_text: str) -> str:
+    """Extract a short response preview suitable for the GUI log."""
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return raw_text.strip()[:240] or "（空响应）"
+    protocol = normalize_api_protocol(api_protocol)
+    if protocol == API_PROTOCOL_ANTHROPIC:
+        content = payload.get("content") if isinstance(payload, dict) else None
+        if isinstance(content, list):
+            texts = [item.get("text", "") for item in content if isinstance(item, dict)]
+            if any(texts):
+                return " ".join(texts).strip()[:240]
+    output_text = payload.get("output_text") if isinstance(payload, dict) else None
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()[:240]
+    output = payload.get("output") if isinstance(payload, dict) else None
+    if isinstance(output, list):
+        texts: list[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            for content in item.get("content", []):
+                if isinstance(content, dict) and isinstance(content.get("text"), str):
+                    texts.append(content["text"])
+        if texts:
+            return " ".join(texts).strip()[:240]
+    if isinstance(payload, dict):
+        error_payload = payload.get("error")
+        if error_payload:
+            return json.dumps(error_payload, ensure_ascii=False)[:240]
+        for key in ("message", "id", "type"):
+            if isinstance(payload.get(key), str):
+                return payload[key][:240]
+    return json.dumps(payload, ensure_ascii=False)[:240]
 
 
 def provider_toml(provider: "Provider") -> str:
@@ -268,6 +368,8 @@ class CodexConfigStudio(tk.Tk):
         self.selected_provider = 0
         self.config_data: dict[str, Any] = {}
         self.process: subprocess.Popen[str] | None = None
+        self.test_events: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self.test_thread: threading.Thread | None = None
 
         self.provider_id = tk.StringVar()
         self.provider_name = tk.StringVar()
@@ -287,6 +389,7 @@ class CodexConfigStudio(tk.Tk):
         self.force_selection = tk.BooleanVar(value=True)
         self.config_status = tk.StringVar(value="未读取配置")
         self.command_status = tk.StringVar(value="等待生成命令")
+        self.test_status = tk.StringVar(value="尚未测试")
 
         self._style()
         self._layout()
@@ -374,7 +477,12 @@ class CodexConfigStudio(tk.Tk):
         self._entry(parent, "Bearer Token（明文）", self.token)
         ttk.Checkbutton(parent, text="使用 Codex/OpenAI 登录认证（requires_openai_auth）", variable=self.requires_openai_auth).pack(anchor="w", pady=(2, 3))
         ttk.Checkbutton(parent, text="supports_websockets", variable=self.supports_websockets).pack(anchor="w", pady=(0, 10))
-        ttk.Button(parent, text="应用当前供应商修改", command=self._apply_provider_form).pack(fill="x")
+        provider_actions = ttk.Frame(parent, style="Panel.TFrame")
+        provider_actions.pack(fill="x")
+        ttk.Button(provider_actions, text="应用修改", command=self._apply_provider_form).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.test_button = ttk.Button(provider_actions, text="连通测试", style="Primary.TButton", command=self._test_provider)
+        self.test_button.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        ttk.Label(parent, textvariable=self.test_status, style="Muted.TLabel", wraplength=285, justify="left").pack(anchor="w", pady=(7, 0))
         ttk.Button(parent, text="写入 config.toml", style="Primary.TButton", command=self._write_config).pack(fill="x", pady=(8, 0))
         ttk.Label(parent, textvariable=self.config_status, style="Muted.TLabel", wraplength=260, justify="left").pack(anchor="w", pady=(12, 0))
 
@@ -486,6 +594,113 @@ class CodexConfigStudio(tk.Tk):
     def _provider_form_changed(self) -> None:
         if hasattr(self, "config_status"):
             self.config_status.set("有未应用的供应商修改")
+        if hasattr(self, "test_status") and (
+            self.test_thread is None or not self.test_thread.is_alive()
+        ):
+            self.test_status.set("配置已修改，请重新测试")
+
+    def _provider_from_form(self) -> Provider:
+        provider_id = self.provider_id.get().strip()
+        if not provider_id or not re.fullmatch(r"[A-Za-z0-9_-]+", provider_id):
+            raise ValueError("Provider ID 无效：只允许字母、数字、下划线和连字符")
+        if any(
+            index != self.selected_provider and item.provider_id == provider_id
+            for index, item in enumerate(self.providers)
+        ):
+            raise ValueError(f"Provider ID 重复：{provider_id}")
+        api_protocol = self.api_protocol.get().strip().lower()
+        if api_protocol not in API_PROTOCOLS:
+            raise ValueError("API 协议只能选择 OpenAI 或 Anthropic")
+        return Provider(
+            provider_id=provider_id,
+            name=self.provider_name.get().strip() or provider_id,
+            base_url=self.base_url.get().strip(),
+            wire_api="responses",
+            token=self.token.get(),
+            requires_openai_auth=self.requires_openai_auth.get(),
+            supports_websockets=self.supports_websockets.get(),
+            api_protocol=api_protocol,
+        )
+
+    def _test_provider(self) -> None:
+        if self.test_thread is not None and self.test_thread.is_alive():
+            return
+        try:
+            provider = self._provider_from_form()
+            model = self.active_model.get().strip()
+            endpoint, headers, payload = test_request_payload(provider, model)
+        except ValueError as exc:
+            messagebox.showerror("无法测试供应商", str(exc))
+            return
+        self.test_button.configure(state="disabled")
+        self.test_status.set(f"测试中：{api_protocol_label(provider.api_protocol)} / {model}")
+        self._append_output(
+            f"\n[连通测试] {provider.provider_id} · {api_protocol_label(provider.api_protocol)}\n"
+            f"POST {redact_secret(endpoint, provider.token)}\n"
+        )
+        self.test_thread = threading.Thread(
+            target=self._run_provider_test,
+            args=(provider, model, endpoint, headers, payload),
+            daemon=True,
+        )
+        self.test_thread.start()
+
+    def _run_provider_test(
+        self,
+        provider: Provider,
+        model: str,
+        endpoint: str,
+        headers: dict[str, str],
+        payload: bytes,
+    ) -> None:
+        started = time.monotonic()
+        request = url_request.Request(endpoint, data=payload, headers=headers, method="POST")
+        try:
+            with url_request.urlopen(request, timeout=TEST_TIMEOUT_SECONDS) as response:
+                raw_text = response.read(1_000_000).decode("utf-8", errors="replace")
+                status = int(response.status)
+            summary = response_summary(provider.api_protocol, raw_text)
+            self.test_events.put(
+                (
+                    "result",
+                    {
+                        "ok": 200 <= status < 300,
+                        "status": status,
+                        "summary": redact_secret(summary, provider.token),
+                        "elapsed": time.monotonic() - started,
+                        "model": model,
+                    },
+                )
+            )
+        except url_error.HTTPError as exc:
+            try:
+                raw_text = exc.read(1_000_000).decode("utf-8", errors="replace")
+            except OSError:
+                raw_text = str(exc)
+            summary = response_summary(provider.api_protocol, raw_text)
+            self.test_events.put(
+                (
+                    "result",
+                    {
+                        "ok": False,
+                        "status": int(exc.code),
+                        "summary": redact_secret(summary, provider.token),
+                        "elapsed": time.monotonic() - started,
+                        "model": model,
+                    },
+                )
+            )
+        except (url_error.URLError, TimeoutError, OSError) as exc:
+            self.test_events.put(
+                (
+                    "error",
+                    {
+                        "summary": redact_secret(str(exc), provider.token),
+                        "elapsed": time.monotonic() - started,
+                        "model": model,
+                    },
+                )
+            )
 
     def _refresh_protocol_hint(self) -> None:
         if self.api_protocol.get() == "Anthropic":
@@ -560,6 +775,7 @@ class CodexConfigStudio(tk.Tk):
         self.provider_list.selection_set(self.selected_provider)
         self.provider_list.activate(self.selected_provider)
         self.config_status.set(f"正在编辑供应商 {item.provider_id}")
+        self.test_status.set("尚未测试")
 
     def _add_provider(self) -> None:
         existing_ids = {item.provider_id for item in self.providers}
@@ -580,34 +796,16 @@ class CodexConfigStudio(tk.Tk):
         self._select_provider_index(self.selected_provider)
 
     def _apply_provider_form(self) -> None:
-        provider_id = self.provider_id.get().strip()
-        if not provider_id or not re.fullmatch(r"[A-Za-z0-9_-]+", provider_id):
-            messagebox.showerror("Provider ID 无效", "只允许字母、数字、下划线和连字符")
+        try:
+            provider = self._provider_from_form()
+        except ValueError as exc:
+            messagebox.showerror("供应商配置无效", str(exc))
             return
-        if any(
-            index != self.selected_provider and item.provider_id == provider_id
-            for index, item in enumerate(self.providers)
-        ):
-            messagebox.showerror("Provider ID 重复", f"供应商 {provider_id} 已存在")
-            return
-        api_protocol = self.api_protocol.get().strip().lower()
-        if api_protocol not in API_PROTOCOLS:
-            messagebox.showerror("API 协议无效", "请选择 OpenAI 或 Anthropic")
-            return
-        self.providers[self.selected_provider] = Provider(
-            provider_id=provider_id,
-            name=self.provider_name.get().strip() or provider_id,
-            base_url=self.base_url.get().strip(),
-            wire_api="responses",
-            token=self.token.get(),
-            requires_openai_auth=self.requires_openai_auth.get(),
-            supports_websockets=self.supports_websockets.get(),
-            api_protocol=api_protocol,
-        )
-        self.active_provider.set(provider_id)
+        self.providers[self.selected_provider] = provider
+        self.active_provider.set(provider.provider_id)
         self._refresh_provider_list()
         self._select_provider_index(self.selected_provider)
-        self.config_status.set(f"供应商 {provider_id} 已应用，尚未写盘")
+        self.config_status.set(f"供应商 {provider.provider_id} 已应用，尚未写盘")
 
     def _config_text(self) -> str:
         try:
@@ -644,28 +842,9 @@ class CodexConfigStudio(tk.Tk):
         return True
 
     def _apply_provider_form_silent(self) -> None:
-        provider_id = self.provider_id.get().strip()
-        if not provider_id or not re.fullmatch(r"[A-Za-z0-9_-]+", provider_id):
-            raise ValueError("Provider ID 无效")
-        if any(
-            index != self.selected_provider and item.provider_id == provider_id
-            for index, item in enumerate(self.providers)
-        ):
-            raise ValueError(f"Provider ID 重复：{provider_id}")
-        api_protocol = self.api_protocol.get().strip().lower()
-        if api_protocol not in API_PROTOCOLS:
-            raise ValueError("API 协议只能选择 OpenAI 或 Anthropic")
-        self.providers[self.selected_provider] = Provider(
-            provider_id=provider_id,
-            name=self.provider_name.get().strip() or provider_id,
-            base_url=self.base_url.get().strip(),
-            wire_api="responses",
-            token=self.token.get(),
-            requires_openai_auth=self.requires_openai_auth.get(),
-            supports_websockets=self.supports_websockets.get(),
-            api_protocol=api_protocol,
-        )
-        self.active_provider.set(provider_id)
+        provider = self._provider_from_form()
+        self.providers[self.selected_provider] = provider
+        self.active_provider.set(provider.provider_id)
 
     # ---------- command construction and process ----------
     def _command_args(self) -> list[str]:
@@ -738,6 +917,27 @@ class CodexConfigStudio(tk.Tk):
         self._append_output(f"已打开 Codex 交互终端，PID {self.process.pid}\n")
 
     def _poll_process(self) -> None:
+        try:
+            while True:
+                kind, payload = self.test_events.get_nowait()
+                self.test_thread = None
+                self.test_button.configure(state="normal")
+                elapsed = float(payload.get("elapsed", 0.0))
+                if kind == "result":
+                    status = int(payload.get("status", 0))
+                    summary = str(payload.get("summary", ""))
+                    if payload.get("ok"):
+                        self.test_status.set(f"连通成功 · HTTP {status} · {elapsed:.2f}s")
+                        self._append_output(f"[成功] HTTP {status} · {elapsed:.2f}s · {summary}\n")
+                    else:
+                        self.test_status.set(f"测试失败 · HTTP {status} · {elapsed:.2f}s")
+                        self._append_output(f"[失败] HTTP {status} · {elapsed:.2f}s · {summary}\n")
+                else:
+                    summary = str(payload.get("summary", "未知错误"))
+                    self.test_status.set(f"连接失败 · {elapsed:.2f}s")
+                    self._append_output(f"[连接失败] {elapsed:.2f}s · {summary}\n")
+        except queue.Empty:
+            pass
         process = self.process
         if process is not None:
             return_code = process.poll()
