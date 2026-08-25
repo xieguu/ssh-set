@@ -23,6 +23,9 @@ APP_TITLE = "Codex Config Studio"
 CODEX_HOME = Path.home() / ".codex"
 CONFIG_PATH = CODEX_HOME / "config.toml"
 CODEX_COMMAND = "codex.cmd"
+API_PROTOCOL_OPENAI = "openai"
+API_PROTOCOL_ANTHROPIC = "anthropic"
+API_PROTOCOLS = (API_PROTOCOL_OPENAI, API_PROTOCOL_ANTHROPIC)
 
 
 def toml_string(value: str) -> str:
@@ -47,12 +50,21 @@ def dict_value(data: dict[str, Any], key: str, default: Any = "") -> Any:
     return default if value is None else value
 
 
+def normalize_api_protocol(value: str) -> str:
+    return value if value in API_PROTOCOLS else API_PROTOCOL_OPENAI
+
+
 def provider_toml(provider: "Provider") -> str:
+    api_protocol = normalize_api_protocol(provider.api_protocol)
     lines = [f"[model_providers.{toml_key(provider.provider_id)}]"]
+    # This is a comment because Codex 0.148.0's official config schema only
+    # accepts wire_api = "responses". It lets this GUI remember the user's
+    # OpenAI/Anthropic family choice without making config.toml invalid.
+    lines.append(f"# codex_config_studio_api_protocol = {toml_string(api_protocol)}")
     lines.append(f"name = {toml_string(provider.name)}")
     if provider.base_url:
         lines.append(f"base_url = {toml_string(provider.base_url)}")
-    lines.append(f"wire_api = {toml_string(provider.wire_api)}")
+    lines.append('wire_api = "responses"')
     lines.append(f"requires_openai_auth = {str(provider.requires_openai_auth).lower()}")
     if provider.supports_websockets:
         lines.append("supports_websockets = true")
@@ -70,9 +82,15 @@ class Provider:
     token: str = ""
     requires_openai_auth: bool = False
     supports_websockets: bool = False
+    api_protocol: str = API_PROTOCOL_OPENAI
 
     @classmethod
-    def from_dict(cls, provider_id: str, data: dict[str, Any]) -> "Provider":
+    def from_dict(
+        cls,
+        provider_id: str,
+        data: dict[str, Any],
+        api_protocol: str = API_PROTOCOL_OPENAI,
+    ) -> "Provider":
         return cls(
             provider_id=provider_id,
             name=str(dict_value(data, "name", provider_id)),
@@ -81,11 +99,16 @@ class Provider:
             token=str(dict_value(data, "experimental_bearer_token", "")),
             requires_openai_auth=bool(dict_value(data, "requires_openai_auth", False)),
             supports_websockets=bool(dict_value(data, "supports_websockets", False)),
+            api_protocol=normalize_api_protocol(api_protocol),
         )
 
 
 SECTION_HEADER = re.compile(r"(?m)^[ \t]*\[([^\]\r\n]+)\][ \t]*(?:#.*)?$")
 PROVIDER_HEADER = re.compile(r'''^model_providers\.(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))(.*)$''')
+PROTOCOL_COMMENT = re.compile(
+    r'''^[ \t]*#[ \t]*codex_config_studio_api_protocol[ \t]*=[ \t]*["']?(openai|anthropic)["']?[ \t]*$''',
+    re.IGNORECASE,
+)
 MANAGED_PROVIDER_KEYS = {
     "name",
     "base_url",
@@ -117,6 +140,23 @@ def provider_header_info(header: str) -> tuple[str, bool] | None:
     return provider_id, suffix == ""
 
 
+def provider_protocols_from_text(text: str) -> dict[str, str]:
+    """Read this app's harmless comment metadata from provider sections."""
+    _prefix, blocks = split_toml_sections(text)
+    protocols: dict[str, str] = {}
+    for header, block in blocks:
+        info = provider_header_info(header)
+        if info is None or not info[1]:
+            continue
+        match = next(
+            (candidate for line in block.splitlines() if (candidate := PROTOCOL_COMMENT.fullmatch(line))),
+            None,
+        )
+        if match:
+            protocols[info[0]] = normalize_api_protocol(match.group(1).lower())
+    return protocols
+
+
 def update_root_keys(prefix: str, updates: dict[str, str]) -> str:
     keys = set(updates)
     kept: list[str] = []
@@ -143,6 +183,8 @@ def update_provider_block(block: str, provider: Provider) -> str:
     )
     preserved: list[str] = []
     for line in lines[header_index + 1 :]:
+        if PROTOCOL_COMMENT.fullmatch(line):
+            continue
         match = re.match(r"^\s*([A-Za-z0-9_-]+)\s*=", line)
         if match and match.group(1) in MANAGED_PROVIDER_KEYS:
             continue
@@ -230,12 +272,13 @@ class CodexConfigStudio(tk.Tk):
         self.provider_id = tk.StringVar()
         self.provider_name = tk.StringVar()
         self.base_url = tk.StringVar()
-        self.wire_api = tk.StringVar(value="responses")
+        self.api_protocol = tk.StringVar(value="OpenAI")
+        self.protocol_hint = tk.StringVar()
         self.token = tk.StringVar()
         self.requires_openai_auth = tk.BooleanVar(value=False)
         self.supports_websockets = tk.BooleanVar(value=False)
         self.active_provider = tk.StringVar()
-        self.active_model = tk.StringVar(value="gpt-5.6-sol")
+        self.active_model = tk.StringVar()
         self.reasoning_effort = tk.StringVar(value="high")
         self.prompt = tk.StringVar()
         self.sandbox = tk.StringVar(value="workspace-write")
@@ -267,6 +310,10 @@ class CodexConfigStudio(tk.Tk):
         style.configure("Muted.TLabel", background=self.PANEL, foreground=self.MUTED, font=("Segoe UI", 9))
         style.configure("TEntry", fieldbackground="#0d151f", foreground=self.TEXT, insertcolor=self.TEXT, bordercolor=self.BORDER, lightcolor=self.BORDER, darkcolor=self.BORDER, padding=7)
         style.configure("TCombobox", fieldbackground="#0d151f", foreground=self.TEXT, selectbackground=self.BLUE, padding=6)
+        style.configure("TRadiobutton", background=self.PANEL_2, foreground=self.TEXT)
+        style.map("TRadiobutton", background=[("active", self.PANEL_2)], foreground=[("active", "#ffffff")])
+        style.configure("TCheckbutton", background=self.PANEL, foreground=self.TEXT)
+        style.map("TCheckbutton", background=[("active", self.PANEL)], foreground=[("active", "#ffffff")])
         style.configure("TButton", background="#1c2b3d", foreground=self.TEXT, bordercolor=self.BORDER, lightcolor="#1c2b3d", darkcolor="#1c2b3d", padding=(10, 7))
         style.map("TButton", background=[("active", "#29415b"), ("disabled", "#16202c")])
         style.configure("Primary.TButton", background=self.BLUE, foreground="#07111d", bordercolor=self.BLUE, padding=(13, 8), font=("Segoe UI", 9, "bold"))
@@ -295,7 +342,7 @@ class CodexConfigStudio(tk.Tk):
 
     def _provider_panel(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="供应商配置", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(parent, text="直接编辑 Codex config.toml 的 model_providers。", style="Muted.TLabel").pack(anchor="w", pady=(4, 10))
+        ttk.Label(parent, text="添加第三方供应商，并配置它的 API 类型与连接信息。", style="Muted.TLabel", wraplength=285, justify="left").pack(anchor="w", pady=(4, 10))
         list_row = ttk.Frame(parent, style="Panel.TFrame")
         list_row.pack(fill="x", pady=(0, 9))
         self.provider_list = tk.Listbox(list_row, height=8, bg="#0d151f", fg=self.TEXT, selectbackground="#234c73", selectforeground="#ffffff", activestyle="none", highlightthickness=0, relief="flat", font=("Segoe UI", 10))
@@ -309,10 +356,23 @@ class CodexConfigStudio(tk.Tk):
         self._entry(parent, "Provider ID", self.provider_id)
         self._entry(parent, "显示名称", self.provider_name)
         self._entry(parent, "Base URL", self.base_url)
-        ttk.Label(parent, text="Wire API", style="Muted.TLabel").pack(anchor="w", pady=(1, 3))
-        ttk.Combobox(parent, textvariable=self.wire_api, values=("responses", "chat"), state="readonly").pack(fill="x", pady=(0, 8))
+        ttk.Label(parent, text="API 协议", style="Muted.TLabel").pack(anchor="w", pady=(1, 3))
+        self.protocol_combo = ttk.Combobox(
+            parent,
+            textvariable=self.api_protocol,
+            values=("OpenAI", "Anthropic"),
+            state="readonly",
+        )
+        self.protocol_combo.pack(fill="x", pady=(0, 4))
+        ttk.Label(
+            parent,
+            textvariable=self.protocol_hint,
+            style="Muted.TLabel",
+            wraplength=285,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
         self._entry(parent, "Bearer Token（明文）", self.token)
-        ttk.Checkbutton(parent, text="requires_openai_auth", variable=self.requires_openai_auth).pack(anchor="w", pady=(2, 3))
+        ttk.Checkbutton(parent, text="使用 Codex/OpenAI 登录认证（requires_openai_auth）", variable=self.requires_openai_auth).pack(anchor="w", pady=(2, 3))
         ttk.Checkbutton(parent, text="supports_websockets", variable=self.supports_websockets).pack(anchor="w", pady=(0, 10))
         ttk.Button(parent, text="应用当前供应商修改", command=self._apply_provider_form).pack(fill="x")
         ttk.Button(parent, text="写入 config.toml", style="Primary.TButton", command=self._write_config).pack(fill="x", pady=(8, 0))
@@ -346,8 +406,9 @@ class CodexConfigStudio(tk.Tk):
         row = ttk.Frame(settings, style="Panel.TFrame")
         row.pack(fill="x")
         self._labeled_combo(row, "当前供应商", self.active_provider, (), 0, readonly=True)
-        self._labeled_combo(row, "模型", self.active_model, ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5", "gpt-5.2"), 1, readonly=False)
+        self._labeled_grid_entry(row, "模型 ID（任意自定义）", self.active_model, 1, weight=2)
         self._labeled_combo(row, "Reasoning", self.reasoning_effort, ("minimal", "low", "medium", "high", "xhigh"), 2)
+        ttk.Label(settings, text="模型 ID 不做品牌限制，直接填写供应商提供的精确 ID。", style="Muted.TLabel").pack(anchor="w", pady=(4, 7))
         self._entry(settings, "Prompt（可选）", self.prompt)
         row2 = ttk.Frame(settings, style="Panel.TFrame")
         row2.pack(fill="x")
@@ -400,27 +461,61 @@ class CodexConfigStudio(tk.Tk):
         if variable is self.active_provider:
             self.provider_combo = box
 
+    def _labeled_grid_entry(
+        self,
+        parent: ttk.Frame,
+        label: str,
+        variable: tk.StringVar,
+        column: int,
+        weight: int = 1,
+    ) -> None:
+        frame = ttk.Frame(parent, style="Panel.TFrame")
+        frame.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 8, 0))
+        parent.columnconfigure(column, weight=weight)
+        ttk.Label(frame, text=label, style="Muted.TLabel").pack(anchor="w", pady=(0, 3))
+        ttk.Entry(frame, textvariable=variable).pack(fill="x")
+
     def _bind_reactive_inputs(self) -> None:
         for variable in (self.active_provider, self.active_model, self.reasoning_effort, self.prompt, self.sandbox, self.profile, self.extra_config, self.force_selection):
             variable.trace_add("write", lambda *_: self._refresh_command_preview())
-        for variable in (self.provider_id, self.provider_name, self.base_url, self.wire_api, self.token, self.requires_openai_auth, self.supports_websockets):
+        for variable in (self.provider_id, self.provider_name, self.base_url, self.api_protocol, self.token, self.requires_openai_auth, self.supports_websockets):
             variable.trace_add("write", lambda *_: self._provider_form_changed())
+        self.api_protocol.trace_add("write", lambda *_: self._refresh_protocol_hint())
+        self._refresh_protocol_hint()
 
     def _provider_form_changed(self) -> None:
         if hasattr(self, "config_status"):
             self.config_status.set("有未应用的供应商修改")
 
+    def _refresh_protocol_hint(self) -> None:
+        if self.api_protocol.get() == "Anthropic":
+            self.protocol_hint.set("Anthropic 原生 Messages API 需经兼容网关转换为 Codex 支持的 Responses API。")
+        else:
+            self.protocol_hint.set("OpenAI 类型：直接使用 Codex 支持的 Responses API。")
+
     # ---------- config and providers ----------
     def _load_config_into_ui(self) -> None:
         self.config_data = load_config()
+        try:
+            original_text = CONFIG_PATH.read_text(encoding="utf-8")
+        except OSError:
+            original_text = ""
+        provider_protocols = provider_protocols_from_text(original_text)
         providers = self.config_data.get("model_providers", {})
         if not isinstance(providers, dict):
             providers = {}
-        self.providers = [Provider.from_dict(str(key), value if isinstance(value, dict) else {}) for key, value in providers.items()]
+        self.providers = [
+            Provider.from_dict(
+                str(key),
+                value if isinstance(value, dict) else {},
+                provider_protocols.get(str(key), API_PROTOCOL_OPENAI),
+            )
+            for key, value in providers.items()
+        ]
         if not self.providers:
             self.providers = [Provider("agentrouter", "AgentRouter", "https://agentrouter.org/v1", token="")]
         active = str(dict_value(self.config_data, "model_provider", self.providers[0].provider_id))
-        model = str(dict_value(self.config_data, "model", "gpt-5.6-sol"))
+        model = str(dict_value(self.config_data, "model", ""))
         effort = str(dict_value(self.config_data, "model_reasoning_effort", "high"))
         self.active_model.set(model)
         self.reasoning_effort.set(effort)
@@ -456,7 +551,7 @@ class CodexConfigStudio(tk.Tk):
         self.provider_id.set(item.provider_id)
         self.provider_name.set(item.name)
         self.base_url.set(item.base_url)
-        self.wire_api.set(item.wire_api)
+        self.api_protocol.set("Anthropic" if item.api_protocol == API_PROTOCOL_ANTHROPIC else "OpenAI")
         self.token.set(item.token)
         self.requires_openai_auth.set(item.requires_openai_auth)
         self.supports_websockets.set(item.supports_websockets)
@@ -495,14 +590,19 @@ class CodexConfigStudio(tk.Tk):
         ):
             messagebox.showerror("Provider ID 重复", f"供应商 {provider_id} 已存在")
             return
+        api_protocol = self.api_protocol.get().strip().lower()
+        if api_protocol not in API_PROTOCOLS:
+            messagebox.showerror("API 协议无效", "请选择 OpenAI 或 Anthropic")
+            return
         self.providers[self.selected_provider] = Provider(
             provider_id=provider_id,
             name=self.provider_name.get().strip() or provider_id,
             base_url=self.base_url.get().strip(),
-            wire_api=self.wire_api.get().strip() or "responses",
+            wire_api="responses",
             token=self.token.get(),
             requires_openai_auth=self.requires_openai_auth.get(),
             supports_websockets=self.supports_websockets.get(),
+            api_protocol=api_protocol,
         )
         self.active_provider.set(provider_id)
         self._refresh_provider_list()
@@ -518,13 +618,15 @@ class CodexConfigStudio(tk.Tk):
             original,
             self.providers,
             self.active_provider.get().strip() or self.providers[self.selected_provider].provider_id,
-            self.active_model.get().strip() or "gpt-5.6-sol",
+            self.active_model.get().strip(),
             self.reasoning_effort.get().strip() or "high",
         )
 
     def _write_config(self) -> bool:
         try:
             self._apply_provider_form_silent()
+            if not self.active_model.get().strip():
+                raise ValueError("模型 ID 不能为空，请填写第三方供应商提供的模型 ID")
             config_text = self._config_text()
             try:
                 tomllib.loads(config_text)
@@ -550,14 +652,18 @@ class CodexConfigStudio(tk.Tk):
             for index, item in enumerate(self.providers)
         ):
             raise ValueError(f"Provider ID 重复：{provider_id}")
+        api_protocol = self.api_protocol.get().strip().lower()
+        if api_protocol not in API_PROTOCOLS:
+            raise ValueError("API 协议只能选择 OpenAI 或 Anthropic")
         self.providers[self.selected_provider] = Provider(
             provider_id=provider_id,
             name=self.provider_name.get().strip() or provider_id,
             base_url=self.base_url.get().strip(),
-            wire_api=self.wire_api.get().strip() or "responses",
+            wire_api="responses",
             token=self.token.get(),
             requires_openai_auth=self.requires_openai_auth.get(),
             supports_websockets=self.supports_websockets.get(),
+            api_protocol=api_protocol,
         )
         self.active_provider.set(provider_id)
 

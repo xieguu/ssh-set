@@ -2,3 +2,5 @@ __pycache__/
 *.py[cod]
 .venv/
 profiles.json
+desktop.ini
+屏幕截图*.png
